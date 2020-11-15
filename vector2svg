@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import argparse
+from base64 import b64encode
+import html
 from lxml import etree
 import os
 from pathlib import Path
@@ -13,40 +15,41 @@ UNIT_RE = re.compile(r'di?p|sp')
 
 
 class Resolver:
+    cache = {
+        'black': ('#000000', None),
+        'darkgray': ('#444444', None),
+        'gray': ('#888888', None),
+        'lightgray': ('#CCCCCC', None),
+        'white': ('#FFFFFF', None),
+        'red': ('#FF0000', None),
+        'green': ('#00FF00', None),
+        'blue': ('#0000FF', None),
+        'yellow': ('#FFFF00', None),
+        'cyan': ('#00FFFF', None),
+        'magenta': ('#FF00FF', None),
+        'aqua': ('#00FFFF', None),
+        'fuchsia': ('#FF00FF', None),
+        'darkgrey': ('#444444', None),
+        'grey': ('#888888', None),
+        'lightgrey': ('#CCCCCC', None),
+        'lime': ('#00FF00', None),
+        'maroon': ('#800000', None),
+        'navy': ('#000080', None),
+        'olive': ('#808000', None),
+        'purple': ('#800080', None),
+        'silver': ('#C0C0C0', None),
+        'teal': ('#008080', None),
+    }
+
     def __init__(self, defs, path):
-        self.cache = {
-            'black': ('#000000', None),
-            'darkgray': ('#444444', None),
-            'gray': ('#888888', None),
-            'lightgray': ('#CCCCCC', None),
-            'white': ('#FFFFFF', None),
-            'red': ('#FF0000', None),
-            'green': ('#00FF00', None),
-            'blue': ('#0000FF', None),
-            'yellow': ('#FFFF00', None),
-            'cyan': ('#00FFFF', None),
-            'magenta': ('#FF00FF', None),
-            'aqua': ('#00FFFF', None),
-            'fuchsia': ('#FF00FF', None),
-            'darkgrey': ('#444444', None),
-            'grey': ('#888888', None),
-            'lightgrey': ('#CCCCCC', None),
-            'lime': ('#00FF00', None),
-            'maroon': ('#800000', None),
-            'navy': ('#000080', None),
-            'olive': ('#808000', None),
-            'purple': ('#800080', None),
-            'silver': ('#C0C0C0', None),
-            'teal': ('#008080', None),
-        }
         self.clips = 0
         self.gradients = 0
         self.defs = defs
         self.path = path
 
     def color(self, value):
-        if value in self.cache:
-            return self.cache[value]
+        if value in Resolver.cache:
+            return Resolver.cache[value]
         elif value.startswith('#'):
             alpha = None
             color = value[1:]
@@ -67,7 +70,7 @@ class Resolver:
                     if (item.tag == 'color' and 'name' in item.attrib
                             and item.get('name').strip() == name):
                         result = self.color(item.text.strip())
-                        self.cache[value] = result
+                        Resolver.cache[value] = result
                         return result
             for filepath in find_resources(('color'), self.path):
                 if filepath.name != f'{name}.xml':
@@ -86,7 +89,7 @@ class Resolver:
                     )] = item.get(f'{{{ANDROID_NS}}}color').strip()
                 if values:
                     result = self.color(values[min(values, key=len)])
-                    self.cache[value] = result
+                    Resolver.cache[value] = result
                     return result
         elif value.startswith('?attr/'):
             name = value[value.index('/') + 1:]
@@ -108,7 +111,7 @@ class Resolver:
                                 variants[theme] = subitem.text.strip()
             if variants:
                 result = self.color(variants[max(variants, key=len)])
-                self.cache[value] = result
+                Resolver.cache[value] = result
                 return result
         raise Exception(f'Could not interpret {value} as a color.')
 
@@ -267,7 +270,7 @@ CONVERTERS = {
 }
 
 
-def convert(input, output, dry_run=False, path=()):
+def convert(input, output, dry_run=False, output_html=False, path=()):
     with open(input) as file:
         root = etree.parse(file).getroot()
     svg = etree.Element('svg', nsmap={None: SVG_NS})
@@ -321,7 +324,12 @@ def convert(input, output, dry_run=False, path=()):
     for child in root:
         converter = CONVERTERS[child.tag](input, child, svg, resolver=resolver)
 
-    svg = etree.tostring(svg, encoding='unicode', pretty_print=True)
+    if output_html:
+        svg = ('data:image/svg+xml;base64,' +
+               b64encode(etree.tostring(svg)).decode('ascii'))
+        svg = f'<p>{html.escape(str(input))}<br><img src="{svg}"></p>\n'
+    else:
+        svg = etree.tostring(svg, encoding='unicode', pretty_print=True)
     if output == '-':
         sys.stdout.write(svg)
     elif not dry_run:
@@ -332,13 +340,13 @@ def convert(input, output, dry_run=False, path=()):
 def find_resources(types, path):
     for root in set(path):
         with os.scandir(root) as it:
-            for entry in it:
+            for entry in sorted(it, key=lambda entry: entry.name):
                 if not (entry.is_dir(follow_symlinks=True)
                         and entry.name[:f'{entry.name}-'.index('-')] in types):
                     continue
                 subdir = root / entry.name
                 with os.scandir(subdir) as it:
-                    for entry in it:
+                    for entry in sorted(it, key=lambda entry: entry.name):
                         if entry.is_file(follow_symlinks=True):
                             yield subdir / entry.name
 
@@ -367,6 +375,10 @@ def main(argv):
                         '--dry-run',
                         action='store_true',
                         help='Do not write output files.')
+    parser.add_argument('-H',
+                        '--html',
+                        action='store_true',
+                        help='Output as HTML.')
     parser.add_argument('-o',
                         '--output',
                         metavar='file.svg',
@@ -383,24 +395,28 @@ def main(argv):
     )
     args = parser.parse_args(argv)
     if args.path is None:
-        path = set()
+        path = []
         for (dirpath, dirnames, filenames) in os.walk('.'):
             dirpath = Path(dirpath)
             new_dirnames = []
-            for dirname in dirnames:
+            for dirname in sorted(dirnames):
                 if (dirname == 'res' and len(dirpath.parts) > 1
                         and dirpath.parts[-2] == 'src'):
-                    path.add(dirpath / dirname)
+                    path.append(dirpath / dirname)
                 elif not (dirname.startswith('.') or dirname == 'build'):
                     new_dirnames.append(dirname)
             dirnames[:] = new_dirnames
     else:
         path = set(args.path)
     for input in args.input or find_vectors(path):
-        output = args.output or ('-' if input == '-' else
-                                 input.with_suffix('.svg'))
+        output = args.output or ('-' if input == '-' else input.with_suffix(
+            '.html' if args.html else '.svg'))
         print(f'{input} -> {output}', file=sys.stderr)
-        convert(input=input, output=output, dry_run=args.dry_run, path=path)
+        convert(input=input,
+                output=output,
+                dry_run=args.dry_run,
+                output_html=args.html,
+                path=path)
 
 
 if __name__ == '__main__':
