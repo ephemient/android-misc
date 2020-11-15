@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+import argparse
+from lxml import etree
+import os
+from pathlib import Path
+import re
+import sys
+
+ANDROID_NS = 'http://schemas.android.com/apk/res/android'
+AAPT_NS = 'http://schemas.android.com/aapt'
+SVG_NS = 'http://www.w3.org/2000/svg'
+UNIT_RE = re.compile(r'di?p|sp')
+
+
+class Resolver:
+    def __init__(self, defs, path):
+        self.cache = {}
+        self.clips = 0
+        self.gradients = 0
+        self.defs = defs
+        self.path = path
+
+    def color(self, value):
+        if value in self.cache:
+            return self.cache[value]
+        elif value.startswith('#'):
+            alpha = None
+            color = value[1:]
+            if len(color) > 6:
+                alpha = str(int(color[:-6], base=16) / 255.)
+                color = color[-6:]
+            return f'#{color}', alpha
+        elif value.startswith('@color/'):
+            name = value[value.index('/') + 1:]
+            for filepath in find_resources(('values'), self.path):
+                if filepath.suffix != '.xml':
+                    continue
+                with open(filepath) as file:
+                    root = etree.parse(file).getroot()
+                if root.tag != 'resources':
+                    continue
+                for item in root:
+                    if (item.tag == 'color' and 'name' in item.attrib
+                            and item.get('name').strip() == name):
+                        result = self.color(item.text.strip())
+                        self.cache[value] = result
+                        return result
+            for filepath in find_resources(('color'), self.path):
+                if filepath.name != f'{name}.xml':
+                    continue
+                with open(filepath) as file:
+                    root = etree.parse(file).getroot()
+                if root.tag != 'selector':
+                    continue
+                values = {}
+                for item in root:
+                    if item.tag != 'item' or f'{{{ANDROID_NS}}}color' not in item.attrib:
+                        continue
+                    values[frozenset(
+                        (k, v) for k, v in item.attrib.items()
+                        if k.startswith(f'{{{ANDROID_NS}}}state_')
+                    )] = item.get(f'{{{ANDROID_NS}}}color').strip()
+                if values:
+                    result = self.color(values[min(values, key=len)])
+                    self.cache[value] = result
+                    return result
+        elif value.startswith('?attr/'):
+            name = value[value.index('/') + 1:]
+            variants = {}
+            for filepath in find_resources(('values'), self.path):
+                if filepath.suffix != '.xml':
+                    continue
+                with open(filepath) as file:
+                    root = etree.parse(file).getroot()
+                if root.tag != 'resources':
+                    continue
+                for item in root:
+                    if item.tag == 'style' and 'name' in item.attrib:
+                        theme = item.get('name').strip()
+                        for subitem in item:
+                            if (subitem.tag == 'item'
+                                    and 'name' in subitem.attrib
+                                    and subitem.get('name').strip() == name):
+                                variants[theme] = subitem.text.strip()
+            if variants:
+                result = self.color(variants[max(variants, key=len)])
+                self.cache[value] = result
+                return result
+        raise Exception(f'Could not interpret {value} as a color.')
+
+    def next_clip_id(self):
+        self.clips += 1
+        return f'Clip{self.clips}'
+
+    def next_gradient_id(self):
+        self.gradients += 1
+        return f'Gradient{self.gradients}'
+
+    def gradient(self, element):
+        dest = etree.SubElement(
+            self.defs,
+            element.get(f'{{{ANDROID_NS}}}type', 'linear').strip() +
+            'Gradient')
+        dest.set('id', self.next_gradient_id())
+        if f'{{{ANDROID_NS}}}centerX' in element:
+            dest.set('cx', element.get(f'{{{ANDROID_NS}}}centerX'))
+        if f'{{{ANDROID_NS}}}centerY' in element:
+            dest.set('cy', element.get(f'{{{ANDROID_NS}}}centerY'))
+        if f'{{{ANDROID_NS}}}gradientRadius' in element:
+            dest.set('r', element.get(f'{{{ANDROID_NS}}}gradientRadius'))
+        if f'{{{ANDROID_NS}}}startX' in element:
+            dest.set('x1', element.get(f'{{{ANDROID_NS}}}startX'))
+        if f'{{{ANDROID_NS}}}startY' in element:
+            dest.set('y1', element.get(f'{{{ANDROID_NS}}}startY'))
+        if f'{{{ANDROID_NS}}}endX' in element:
+            dest.set('x2', element.get(f'{{{ANDROID_NS}}}endX'))
+        if f'{{{ANDROID_NS}}}endY' in element:
+            dest.set('y2', element.get(f'{{{ANDROID_NS}}}endY'))
+        if f'{{{ANDROID_NS}}}startColor' in element:
+            color, alpha = self.color(
+                element.get(f'{{{ANDROID_NS}}}startColor').strip())
+            target = etree.SubElement(dest, 'stop')
+            target.set('offset', '0%')
+            target.set('stop-color', color)
+            if alpha is not None:
+                target.set('stop-alpha', alpha)
+        if f'{{{ANDROID_NS}}}stopColor' in element:
+            color, alpha = self.color(
+                element.get(f'{{{ANDROID_NS}}}stopColor').strip())
+            target = etree.SubElement(dest, 'stop')
+            target.set('offset', '100%')
+            target.set('stop-color', color)
+            if alpha is not None:
+                target.set('stop-alpha', alpha)
+        if (f'{{{ANDROID_NS}}}tileMode' in element.attrib
+                or f'{{{ANDROID_NS}}}centerColor' in element.attrib):
+            print(f'warning: unsupported gradient attributes in {input}',
+                  file=sys.stderr)
+        for child in element:
+            if child.tag != 'item':
+                continue
+            target = etree.SubElement(dest, 'stop')
+            target.set(
+                'offset',
+                str(float(child.get(f'{{{ANDROID_NS}}}offset')) * 100) + '%')
+            color, alpha = self.color(
+                child.get(f'{{{ANDROID_NS}}}color').strip())
+            target.set('stop-color', color)
+            if alpha is not None:
+                target.set('stop-opacity', alpha)
+        return f'url(#{dest.get("id")})'
+
+
+def convert_clip_path(input, source, dest, resolver):
+    target = etree.SubElement(dest, 'clipPath')
+    target.set('id', resolver.next_clip_id())
+    if f'{{{ANDROID_NS}}}name' in source.attrib:
+        target.set('name', source.get(f'{{{ANDROID_NS}}}name'))
+    etree.SubElement(target,
+                     'path').set('d', source.get(f'{{{ANDROID_NS}}}pathData'))
+    dest.set('clip-path', f'url(#{target.get("id")})')
+
+
+def convert_group(input, source, dest, resolver):
+    target = etree.SubElement(dest, 'g')
+    if f'{{{ANDROID_NS}}}name' in source.attrib:
+        target.set('name', source.get(f'{{{ANDROID_NS}}}name'))
+    rotation = source.get(f'{{{ANDROID_NS}}}rotation', '').strip()
+    pivotX = source.get(f'{{{ANDROID_NS}}}pivotX', '').strip()
+    pivotY = source.get(f'{{{ANDROID_NS}}}pivotY', '').strip()
+    scaleX = source.get(f'{{{ANDROID_NS}}}scaleX', '').strip()
+    scaleY = source.get(f'{{{ANDROID_NS}}}scaleY', '').strip()
+    translateX = source.get(f'{{{ANDROID_NS}}}translateX', '').strip()
+    translateY = source.get(f'{{{ANDROID_NS}}}translateY', '').strip()
+    if any((rotation, pivotX, pivotY, scaleX, scaleY, translateX, translateY)):
+        target.set(
+            'transform',
+            f'translate({translateX or 0} {translateY or 0}) '
+            f'scale({scaleX or 1} {scaleY or 1}) '
+            f'rotate({rotation or 0} {pivotX or 0} {pivotY or 0})')
+    for child in source:
+        CONVERTERS[child.tag](input, child, target, resolver)
+
+
+def convert_path(input, source, dest, resolver):
+    target = etree.SubElement(dest, 'path')
+    if f'{{{ANDROID_NS}}}name' in source.attrib:
+        target.set('name', source.get(f'{{{ANDROID_NS}}}name'))
+    target.set('d', source.get(f'{{{ANDROID_NS}}}pathData'))
+    alpha = None
+    if f'{{{ANDROID_NS}}}fillColor' in source.attrib:
+        color, alpha = resolver.color(
+            source.get(f'{{{ANDROID_NS}}}fillColor').strip())
+        target.set('fill', color)
+    alpha = source.get(f'{{{ANDROID_NS}}}fillAlpha', alpha)
+    if alpha is not None:
+        target.set('fill-opacity', alpha)
+    alpha = None
+    if f'{{{ANDROID_NS}}}strokeColor' in source.attrib:
+        color, alpha = resolver.color(
+            source.get(f'{{{ANDROID_NS}}}strokeColor').strip())
+        target.set('stroke', color)
+    alpha = source.get(f'{{{ANDROID_NS}}}strokeAlpha', alpha)
+    if alpha is not None:
+        target.set('stroke-opacity', alpha)
+    if f'{{{ANDROID_NS}}}strokeWidth' in source.attrib:
+        target.set('stroke-width', source.get(f'{{{ANDROID_NS}}}strokeWidth'))
+    if f'{{{ANDROID_NS}}}strokeLineCap' in source.attrib:
+        target.set('stroke-linecap',
+                   source.get(f'{{{ANDROID_NS}}}strokeLineCap'))
+    if f'{{{ANDROID_NS}}}strokeLineJoin' in source.attrib:
+        target.set('stroke-linejoin',
+                   source.get(f'{{{ANDROID_NS}}}strokeLineJoin'))
+    if f'{{{ANDROID_NS}}}strokeMiterLimit' in source.attrib:
+        target.set('stroke-miterlimit',
+                   source.get(f'{{{ANDROID_NS}}}strokeMiterLimit'))
+    if f'{{{ANDROID_NS}}}fillType' in source.attrib:
+        target.set('fill-rule', source.get(f'{{{ANDROID_NS}}}fillType'))
+    if (f'{{{ANDROID_NS}}}trimPathStart' in source.attrib
+            or f'{{{ANDROID_NS}}}trimPathEnd' in source.attrib
+            or f'{{{ANDROID_NS}}}trimPathOffset' in source.attrib):
+        print(f'warning: unsupported trim attributes in {input}',
+              file=sys.stderr)
+    for child in source:
+        if (child.tag != f'{{{AAPT_NS}}}attr'
+                or child.get('name') != 'android:fillColor' or len(child) != 1
+                or child[0].tag != 'gradient'):
+            print(f'warning: unsupported aapt:attr in {input}',
+                  file=sys.stderr)
+        target.set('fill', resolver.gradient(child[0]))
+
+
+CONVERTERS = {
+    'clip-path': convert_clip_path,
+    'group': convert_group,
+    'path': convert_path
+}
+
+
+def convert(input, output, dry_run=False, path=()):
+    with open(input) as file:
+        root = etree.parse(file).getroot()
+    svg = etree.Element('svg', nsmap={None: SVG_NS})
+
+    if f'{{{ANDROID_NS}}}name' in root.attrib:
+        svg.set('name', root.get(f'{{{ANDROID_NS}}}name'))
+    svg.set('width', re.sub(UNIT_RE, 'px', root.get(f'{{{ANDROID_NS}}}width')))
+    svg.set('height', re.sub(UNIT_RE, 'px',
+                             root.get(f'{{{ANDROID_NS}}}height')))
+    viewportWidth = root.get(f'{{{ANDROID_NS}}}viewportWidth')
+    viewportHeight = root.get(f'{{{ANDROID_NS}}}viewportHeight')
+    svg.set('viewBox', f'0 0 {viewportWidth} {viewportHeight}')
+    if f'{{{ANDROID_NS}}}alpha' in root.attrib:
+        svg.set('opacity', root.get(f'{{{ANDROID_NS}}}alpha'))
+    if f'{{{ANDROID_NS}}}tint' in root.attrib or f'{{{ANDROID_NS}}}tintMode' in root.attrib:
+        print(f'warning: unsupported tint attributes in {input}',
+              file=sys.stderr)
+    resolver = Resolver(etree.SubElement(svg, 'defs'), path)
+    for child in root:
+        converter = CONVERTERS[child.tag](input, child, svg, resolver=resolver)
+
+    svg = etree.tostring(svg, encoding='unicode', pretty_print=True)
+    if output == '-':
+        sys.stdout.write(svg)
+    elif not dry_run:
+        with open(output, 'w') as file:
+            file.write(svg)
+
+
+def find_resources(types, path):
+    for root in set(path):
+        with os.scandir(root) as it:
+            for entry in it:
+                if not (entry.is_dir(follow_symlinks=True)
+                        and entry.name[:f'{entry.name}-'.index('-')] in types):
+                    continue
+                subdir = root / entry.name
+                with os.scandir(subdir) as it:
+                    for entry in it:
+                        if entry.is_file(follow_symlinks=True):
+                            yield subdir / entry.name
+
+
+def find_vectors(path):
+    for filepath in find_resources({'drawable', 'mipmap'}, path):
+        if filepath.suffix != '.xml':
+            continue
+        with open(filepath) as file:
+            root = etree.parse(file).getroot()
+        if root.tag == 'vector':
+            yield filepath
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(
+        description='Converts VectorDrawable XML files to SVG files.')
+    parser.add_argument(
+        'input',
+        metavar='file.xml',
+        nargs='*',
+        help='If none are given, convert all vectors in --path. '
+        'May be - for stdin.')
+    parser.add_argument('-n',
+                        '--dry-run',
+                        action='store_true',
+                        help='Do not write output files.')
+    parser.add_argument('-o',
+                        '--output',
+                        metavar='file.svg',
+                        type=str,
+                        help='May be - for stdout.')
+    parser.add_argument(
+        '-p',
+        '--path',
+        type=Path,
+        metavar='.../res',
+        action='append',
+        help='Find resources in this directory. May be given multiple times. '
+        'If unspecified, will scan the current working tree for res directories.'
+    )
+    args = parser.parse_args(argv)
+    if args.path is None:
+        path = set()
+        for (dirpath, dirnames, filenames) in os.walk('.'):
+            dirpath = Path(dirpath)
+            new_dirnames = []
+            for dirname in dirnames:
+                if (dirname == 'res' and len(dirpath.parts) > 1
+                        and dirpath.parts[-2] == 'src'):
+                    path.add(dirpath / dirname)
+                elif not (dirname.startswith('.') or dirname == 'build'):
+                    new_dirnames.append(dirname)
+            dirnames[:] = new_dirnames
+    else:
+        path = set(args.path)
+    for input in args.input or find_vectors(path):
+        output = args.output or ('-' if input == '-' else
+                                 input.with_suffix('.svg'))
+        print(f'{input} -> {output}', file=sys.stderr)
+        convert(input=input, output=output, dry_run=args.dry_run, path=path)
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
