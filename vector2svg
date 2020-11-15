@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 import argparse
 from base64 import b64encode
+from contextlib import ExitStack
 import html
 from lxml import etree
 import os
 from pathlib import Path
 import re
+import shlex
 import sys
 
 ANDROID_NS = 'http://schemas.android.com/apk/res/android'
@@ -270,9 +272,12 @@ CONVERTERS = {
 }
 
 
-def convert(input, output, dry_run=False, output_html=False, path=()):
-    with open(input) as file:
-        root = etree.parse(file).getroot()
+def convert(input, output, dry_run=False, path=()):
+    if str(input) == '-':
+        root = etree.parse(sys.stdin).getroot()
+    else:
+        with open(input) as file:
+            root = etree.parse(file).getroot()
     svg = etree.Element('svg', nsmap={None: SVG_NS})
 
     if f'{{{ANDROID_NS}}}name' in root.attrib:
@@ -324,21 +329,18 @@ def convert(input, output, dry_run=False, output_html=False, path=()):
     for child in root:
         converter = CONVERTERS[child.tag](input, child, svg, resolver=resolver)
 
-    if output_html:
-        svg = ('data:image/svg+xml;base64,' +
-               b64encode(etree.tostring(svg)).decode('ascii'))
-        svg = f'<p>{html.escape(str(input))}<br><img src="{svg}"></p>\n'
-    else:
-        svg = etree.tostring(svg, encoding='unicode', pretty_print=True)
-    if output == '-':
-        sys.stdout.write(svg)
-    elif not dry_run:
-        with open(output, 'w') as file:
-            file.write(svg)
+    if not dry_run:
+        doc = etree.tostring(svg, encoding='unicode', pretty_print=True)
+        if output == '-':
+            sys.stdout.write(doc)
+        elif not dry_run:
+            with open(output, 'w') as file:
+                file.write(doc)
+    return etree.tostring(svg)
 
 
 def find_resources(types, path):
-    for root in set(path):
+    for root in path:
         with os.scandir(root) as it:
             for entry in sorted(it, key=lambda entry: entry.name):
                 if not (entry.is_dir(follow_symlinks=True)
@@ -375,15 +377,16 @@ def main(argv):
                         '--dry-run',
                         action='store_true',
                         help='Do not write output files.')
-    parser.add_argument('-H',
-                        '--html',
-                        action='store_true',
-                        help='Output as HTML.')
     parser.add_argument('-o',
                         '--output',
                         metavar='file.svg',
-                        type=str,
+                        type=Path,
                         help='May be - for stdout.')
+    parser.add_argument('-O',
+                        '--output-html',
+                        metavar='index.html',
+                        type=Path,
+                        help='Output as HTML.')
     parser.add_argument(
         '-p',
         '--path',
@@ -393,7 +396,7 @@ def main(argv):
         help='Find resources in this directory. May be given multiple times. '
         'If unspecified, will scan the current working tree for res directories.'
     )
-    args = parser.parse_args(argv)
+    args = parser.parse_args(argv[1:])
     if args.path is None:
         path = []
         for (dirpath, dirnames, filenames) in os.walk('.'):
@@ -407,17 +410,65 @@ def main(argv):
                     new_dirnames.append(dirname)
             dirnames[:] = new_dirnames
     else:
-        path = set(args.path)
-    for input in args.input or find_vectors(path):
-        output = args.output or ('-' if input == '-' else input.with_suffix(
-            '.html' if args.html else '.svg'))
-        print(f'{input} -> {output}', file=sys.stderr)
-        convert(input=input,
-                output=output,
-                dry_run=args.dry_run,
-                output_html=args.html,
-                path=path)
+        path = list({p: None for p in args.path}.keys())
+    with ExitStack() as stack:
+        if args.output_html:
+            output_html = stack.enter_context(
+                open(args.output_html, 'w'
+                     ) if str(args.output_html) != '-' else sys.stderr)
+            print(
+                '''
+<!DOCTYPE html>
+<html>
+<head>
+<title>vector2svg</title>
+<style>
+@keyframes background-x {
+    from { background-position-x: 0% }
+    to { background-position-x: 16px }
+}
+@keyframes background-y {
+    from { background-position-y: 0% }
+    to { background-position-y: 16px }
+}
+img {
+    animation:
+        ease-in-out 1s infinite alternate background-x,
+        ease-in-out 1s 0.5s infinite alternate background-y;
+    color: #ffffff;
+    background-attachment: fixed;
+    background-color: #4c4c4c;
+    background-image:
+        linear-gradient(to right, #ffffff1d 50%, transparent 50%),
+        linear-gradient(to bottom, #ffffff1d 50%, transparent 50%);
+    background-size: 16px 16px;
+}
+</style>
+</head>
+<body>
+'''.strip(),
+                file=output_html)
+        else:
+            output_html = None
+        for input in args.input or find_vectors(path):
+            output = args.output or ('-' if str(input) == '-' else
+                                     input.with_suffix('.svg'))
+            print(f'{input} -> {output}', file=sys.stderr)
+            svg = convert(input=input,
+                          output=output,
+                          dry_run=args.dry_run,
+                          path=path)
+            if output_html:
+                print(
+                    f'<p>{html.escape(str(input))}<br><img src="'
+                    f'data:image/svg+xml;base64,{b64encode(svg).decode()}"></p>',
+                    file=output_html)
+        if output_html:
+            print('''
+</body>
+</html>
+'''.strip(), file=output_html)
 
 
 if __name__ == '__main__':
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(main(sys.argv))
