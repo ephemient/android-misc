@@ -14,7 +14,31 @@ UNIT_RE = re.compile(r'di?p|sp')
 
 class Resolver:
     def __init__(self, defs, path):
-        self.cache = {}
+        self.cache = {
+            'black': ('#000000', None),
+            'darkgray': ('#444444', None),
+            'gray': ('#888888', None),
+            'lightgray': ('#CCCCCC', None),
+            'white': ('#FFFFFF', None),
+            'red': ('#FF0000', None),
+            'green': ('#00FF00', None),
+            'blue': ('#0000FF', None),
+            'yellow': ('#FFFF00', None),
+            'cyan': ('#00FFFF', None),
+            'magenta': ('#FF00FF', None),
+            'aqua': ('#00FFFF', None),
+            'fuchsia': ('#FF00FF', None),
+            'darkgrey': ('#444444', None),
+            'grey': ('#888888', None),
+            'lightgrey': ('#CCCCCC', None),
+            'lime': ('#00FF00', None),
+            'maroon': ('#800000', None),
+            'navy': ('#000080', None),
+            'olive': ('#808000', None),
+            'purple': ('#800080', None),
+            'silver': ('#C0C0C0', None),
+            'teal': ('#008080', None),
+        }
         self.clips = 0
         self.gradients = 0
         self.defs = defs
@@ -97,10 +121,11 @@ class Resolver:
         return f'Gradient{self.gradients}'
 
     def gradient(self, element):
-        dest = etree.SubElement(
-            self.defs,
-            element.get(f'{{{ANDROID_NS}}}type', 'linear').strip() +
-            'Gradient')
+        gradient_type = element.get(f'{{{ANDROID_NS}}}type', 'linear').strip()
+        if gradient_type not in ('linear', 'radial'):
+            raise Exception(f'Unsupported gradient type {gradient_type}',
+                            file=sys.stderr)
+        dest = etree.SubElement(self.defs, f'{gradient_type}Gradient')
         dest.set('id', self.next_gradient_id())
         if f'{{{ANDROID_NS}}}centerX' in element:
             dest.set('cx', element.get(f'{{{ANDROID_NS}}}centerX'))
@@ -174,8 +199,7 @@ def convert_group(input, source, dest, resolver):
     translateY = source.get(f'{{{ANDROID_NS}}}translateY', '').strip()
     if any((rotation, pivotX, pivotY, scaleX, scaleY, translateX, translateY)):
         target.set(
-            'transform',
-            f'translate({translateX or 0} {translateY or 0}) '
+            'transform', f'translate({translateX or 0} {translateY or 0}) '
             f'scale({scaleX or 1} {scaleY or 1}) '
             f'rotate({rotation or 0} {pivotX or 0} {pivotY or 0})')
     for child in source:
@@ -222,11 +246,17 @@ def convert_path(input, source, dest, resolver):
         print(f'warning: unsupported trim attributes in {input}',
               file=sys.stderr)
     for child in source:
-        if (child.tag != f'{{{AAPT_NS}}}attr'
-                or child.get('name') != 'android:fillColor' or len(child) != 1
-                or child[0].tag != 'gradient'):
-            print(f'warning: unsupported aapt:attr in {input}',
+        if child.tag != f'{{{AAPT_NS}}}attr' or 'name' not in child.attrib:
+            continue
+        if child.get('name') != 'android:fillColor':
+            print(f'warning: unsupported {child.get("name")} in {input}',
                   file=sys.stderr)
+            continue
+        if len(child) != 1 or child[0].tag != 'gradient':
+            print(f'warning: unsupported android:fillColor <' +
+                  ' '.join(inner.tag for inner in child) + f'> in {input}',
+                  file=sys.stderr)
+            continue
         target.set('fill', resolver.gradient(child[0]))
 
 
@@ -252,10 +282,42 @@ def convert(input, output, dry_run=False, path=()):
     svg.set('viewBox', f'0 0 {viewportWidth} {viewportHeight}')
     if f'{{{ANDROID_NS}}}alpha' in root.attrib:
         svg.set('opacity', root.get(f'{{{ANDROID_NS}}}alpha'))
-    if f'{{{ANDROID_NS}}}tint' in root.attrib or f'{{{ANDROID_NS}}}tintMode' in root.attrib:
-        print(f'warning: unsupported tint attributes in {input}',
-              file=sys.stderr)
-    resolver = Resolver(etree.SubElement(svg, 'defs'), path)
+    defs = etree.SubElement(svg, 'defs')
+    resolver = Resolver(defs, path)
+    if f'{{{ANDROID_NS}}}tint' in root.attrib:
+        tint_color, tint_alpha = resolver.color(
+            root.get(f'{{{ANDROID_NS}}}tint'))
+        tint_mode = root.get(f'{{{ANDROID_NS}}}tintMode', 'src_in').strip()
+        tint = etree.SubElement(defs, 'filter')
+        tint.set('id', 'Tint')
+        flood = etree.SubElement(tint, 'feFlood')
+        flood.set('flood-color', tint_color)
+        if tint_alpha is not None:
+            flood.set('flood-opacity', tint_alpha)
+        flood.set('result', 'flood')
+        if (tint_mode.startswith('src_') or tint_mode.startswith('dst_')
+                or tint_mode in ('add', 'clear', 'src', 'dst', 'xor')):
+            composite = etree.SubElement(tint, 'feComposite')
+            composite.set(
+                'in', 'SourceGraphic'
+                if tint_mode.startswith('dst_') else 'BackgroundImage')
+            composite.set(
+                'in2', 'BackgroundImage'
+                if tint_mode.startswith('dst_') else 'SourceGraphic')
+            if tint_mode in ('add', 'clear', 'src', 'dst'):
+                composite.set('operator', 'arithmetic')
+                composite.set('k1', '0')
+                composite.set('k2', str(int(tint_mode in ('add', 'src'))))
+                composite.set('k3', str(int(tint_mode in ('add', 'dst'))))
+                composite.set('k4', '0')
+            else:
+                composite.set('operator', tint_mode[tint_mode.find('_') + 1:])
+        else:
+            blend = etree.SubElement(tint, 'feBlend')
+            blend.set('in', 'BackgroundImage')
+            blend.set('in2', 'SourceGraphic')
+            blend.set('mode', tint_mode)
+        svg.set('filter', f'url(#Tint)')
     for child in root:
         converter = CONVERTERS[child.tag](input, child, svg, resolver=resolver)
 
@@ -296,6 +358,7 @@ def main(argv):
         description='Converts VectorDrawable XML files to SVG files.')
     parser.add_argument(
         'input',
+        type=Path,
         metavar='file.xml',
         nargs='*',
         help='If none are given, convert all vectors in --path. '
