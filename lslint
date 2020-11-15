@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+from lxml import etree
+import os
+from pathlib import Path
+import sys
+
+
+def main():
+    issue_ids = set(sys.argv[1:])
+    for dirpath, dirnames, filenames in os.walk('.'):
+        if 'build' in dirnames:
+            dirnames.remove('build')
+            xml_path = Path(
+                dirpath) / 'build' / 'reports' / 'lint-results-debug.xml'
+            if xml_path.exists():
+                try:
+                    process(xml_path, issue_ids)
+                except etree.XMLSyntaxError as e:
+                    print(f'{xml_path}: {e}\n', file=sys.stderr)
+        dirnames[:] = [
+            dirname for dirname in dirnames if not dirname.startswith('.')
+        ]
+
+
+def process(xmlpath, issue_ids=None):
+    with open(xmlpath) as xmlfile:
+        root = etree.parse(xmlfile)
+    issues = root.xpath('//issue')
+    if issue_ids:
+        issues = [issue for issue in issues if issue.attrib['id'] in issue_ids]
+    else:
+        issues = [
+            issue for issue in issues if issue.attrib['severity'] == 'Error'
+        ]
+    if not issues:
+        return
+    print(xmlpath.resolve().as_uri(), file=sys.stderr)
+    for issue in issues:
+        [location] = (child for child in issue if child.tag == 'location')
+        try:
+            print(':'.join([
+                str(Path(location.attrib['file']).relative_to(Path.cwd())),
+                location.attrib['line'],
+            ] + ([] if issue_ids else [issue.attrib['id']]) +
+                           [issue.attrib['errorLine1'].strip()]))
+        except KeyError as e:
+            print('{0} error'.format(issue.attrib['id']), file=sys.stderr)
+    print(file=sys.stderr)
+
+
+if __name__ == '__main__':
+    main()
