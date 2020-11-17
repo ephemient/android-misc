@@ -13,6 +13,7 @@ import sys
 ANDROID_NS = 'http://schemas.android.com/apk/res/android'
 AAPT_NS = 'http://schemas.android.com/aapt'
 SVG_NS = 'http://www.w3.org/2000/svg'
+XLINK_NS = 'http://www.w3.org/1999/xlink'
 UNIT_RE = re.compile(r'di?p|sp')
 
 
@@ -272,12 +273,14 @@ CONVERTERS = {
 }
 
 
-def convert(input, output, dry_run=False, path=()):
+def convert(input, path=()):
     if str(input) == '-':
         root = etree.parse(sys.stdin).getroot()
     else:
         with open(input) as file:
             root = etree.parse(file).getroot()
+    if root.tag == 'adaptive-icon':
+        return convert_adaptive_icon(input, root, path=path)
     svg = etree.Element('svg', nsmap={None: SVG_NS})
 
     if f'{{{ANDROID_NS}}}name' in root.attrib:
@@ -329,14 +332,81 @@ def convert(input, output, dry_run=False, path=()):
     for child in root:
         converter = CONVERTERS[child.tag](input, child, svg, resolver=resolver)
 
-    if not dry_run:
-        doc = etree.tostring(svg, encoding='unicode', pretty_print=True)
-        if output == '-':
-            sys.stdout.write(doc)
-        elif not dry_run:
-            with open(output, 'w') as file:
-                file.write(doc)
-    return etree.tostring(svg)
+    return svg
+
+
+def convert_adaptive_icon(input, root, path=()):
+    svg = etree.Element('svg', nsmap={None: SVG_NS, 'xlink': XLINK_NS})
+    svg.set('width', '108px')
+    svg.set('height', '108px')
+    svg.set('viewBox', '0 0 108 108')
+    resolver = Resolver(etree.SubElement(svg, 'defs'), path)
+    clip = etree.SubElement(svg, 'clipPath')
+    clip.set('id', 'Clip')
+    clip_rect = etree.SubElement(clip, 'rect')
+    clip_rect.set('x', '18')
+    clip_rect.set('y', '18')
+    clip_rect.set('width', '72')
+    clip_rect.set('height', '72')
+    clip_animate = etree.SubElement(clip_rect, 'animate')
+    clip_animate.set('attributeName', 'rx')
+    clip_animate.set('values', '36;36;12;12;36')
+    clip_animate.set('dur', '6s')
+    clip_animate.set('repeatCount', 'indefinite')
+    svg.set('clip-path', 'url(#Clip)')
+    foreground, background = None, None
+    for child in root:
+        if (child.tag == 'foreground' and foreground is None
+                and f'{{{ANDROID_NS}}}drawable' in child.attrib):
+            foreground = child.get(f'{{{ANDROID_NS}}}drawable')
+        if (child.tag == 'background' and background is None
+                and f'{{{ANDROID_NS}}}drawable' in child.attrib):
+            background = child.get(f'{{{ANDROID_NS}}}drawable')
+    foreground = convert_drawable(input, foreground, resolver, path)
+    animate = etree.SubElement(foreground, 'animateMotion')
+    animate.set('dur', '2s')
+    animate.set('repeatCount', 'indefinite')
+    animate.set('path', 'M0,0H8H-8ZV8V-8Z')
+    background = convert_drawable(input, background, resolver, path)
+    animate = etree.SubElement(background, 'animateMotion')
+    animate.set('dur', '2s')
+    animate.set('repeatCount', 'indefinite')
+    animate.set('path', 'M0,0H4H-4ZV4V-4Z')
+    svg.append(background)
+    svg.append(foreground)
+    return svg
+
+
+def convert_drawable(input, name, resolver, path=()):
+    if name.startswith('@drawable/'):
+        name = name[name.index('/') + 1:]
+        element = etree.Element('image')
+        element.set('width', '100%')
+        element.set('height', '100%')
+        for resource in find_resources(('drawable'), path):
+            if resource.stem != name:
+                continue
+            if resource.suffix == '.xml':
+                doc = etree.tostring(convert(resource, path))
+                element.set(
+                    f'{{{XLINK_NS}}}href',
+                    f'data:image/svg+xml;base64,{b64encode(doc).decode()}')
+            else:
+                element.set(
+                    f'{{{XLINK_NS}}}href',
+                    str(resource) if resource.is_absolute() else
+                    os.path.relpath(resource, input))
+            break
+    else:
+        color, alpha = resolver.color(name)
+        element = etree.Element('rect')
+        element.set('width', '100%')
+        element.set('height', '100%')
+        element.set('fill', color)
+        if alpha is not None:
+            element.set('fill-opacity', alpha)
+
+    return element
 
 
 def find_resources(types, path):
@@ -359,7 +429,7 @@ def find_vectors(path):
             continue
         with open(filepath) as file:
             root = etree.parse(file).getroot()
-        if root.tag == 'vector':
+        if root.tag in ('vector', 'adaptive-icon'):
             yield filepath
 
 
@@ -416,8 +486,7 @@ def main(argv):
             output_html = stack.enter_context(
                 open(args.output_html, 'w'
                      ) if str(args.output_html) != '-' else sys.stderr)
-            print(
-                '''
+            print('''
 <!DOCTYPE html>
 <html>
 <head>
@@ -442,26 +511,31 @@ img {
         linear-gradient(to right, #ffffff1d 50%, transparent 50%),
         linear-gradient(to bottom, #ffffff1d 50%, transparent 50%);
     background-size: 16px 16px;
+    outline: 1px dotted #ff0000;
 }
 </style>
 </head>
 <body>
 '''.strip(),
-                file=output_html)
+                  file=output_html)
         else:
             output_html = None
         for input in args.input or find_vectors(path):
             output = args.output or ('-' if str(input) == '-' else
                                      input.with_suffix('.svg'))
             print(f'{input} -> {output}', file=sys.stderr)
-            svg = convert(input=input,
-                          output=output,
-                          dry_run=args.dry_run,
-                          path=path)
+            svg = convert(input=input, path=path)
+            doc = etree.tostring(svg, encoding='unicode', pretty_print=True)
+            if str(output) == '-':
+                sys.stdout.write(doc)
+            elif not args.dry_run:
+                with open(output, 'w') as file:
+                    file.write(doc)
             if output_html:
+                doc = etree.tostring(svg)
                 print(
                     f'<p>{html.escape(str(input))}<br><img src="'
-                    f'data:image/svg+xml;base64,{b64encode(svg).decode()}"></p>',
+                    f'data:image/svg+xml;base64,{b64encode(doc).decode()}"></p>',
                     file=output_html)
         if output_html:
             print('''
