@@ -58,7 +58,7 @@ def process(xmlpath, issue_ids=None):
         return False
     print(xmlpath.resolve().as_uri(), file=sys.stderr)
     for issue in issues:
-        [location] = (child for child in issue if child.tag == 'location')
+        location = next(child for child in issue if child.tag == 'location')
         try:
             print(':'.join([
                 str(Path(location.attrib['file']).relative_to(Path.cwd())),
