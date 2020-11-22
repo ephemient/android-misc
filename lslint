@@ -1,25 +1,47 @@
 #!/usr/bin/env python3
+import argparse
 from lxml import etree
 import os
 from pathlib import Path
+import subprocess
 import sys
 
 
-def main():
-    issue_ids = set(sys.argv[1:])
+def main(argv):
+    parser = argparse.ArgumentParser(
+        description='Search for reported Lint issues.')
+    parser.add_argument(
+        '-o',
+        '--open',
+        action='store_true',
+        help='Open lint reports in $BROWSER (or xdg-open if unset).')
+    parser.add_argument('ids',
+                        metavar='IssueId',
+                        nargs='*',
+                        help='Issue ID(s) to search for.')
+    args = parser.parse_args(argv[1:])
+    issue_ids = set(args.ids)
+    results = []
     for dirpath, dirnames, filenames in os.walk('.'):
         if 'build' in dirnames:
             dirnames.remove('build')
-            xml_path = Path(
-                dirpath) / 'build' / 'reports' / 'lint-results-debug.xml'
+            xml_path = (Path(dirpath) / 'build' / 'reports' /
+                        'lint-results-debug.xml')
+            result = False
             if xml_path.exists():
                 try:
-                    process(xml_path, issue_ids)
+                    result = process(xml_path, issue_ids)
                 except etree.XMLSyntaxError as e:
                     print(f'{xml_path}: {e}\n', file=sys.stderr)
-        dirnames[:] = [
-            dirname for dirname in dirnames if not dirname.startswith('.')
-        ]
+            if result:
+                results.append(xml_path.with_suffix('.html'))
+        dirnames[:] = sorted(dirname for dirname in dirnames
+                             if not dirname.startswith('.'))
+    if results and args.open:
+        subprocess.run(
+            ' '.join([os.environ.get('BROWSER', 'xdg-open')] +
+                     [result.resolve().as_uri() for result in results]),
+            shell=True)
 
 
 def process(xmlpath, issue_ids=None):
@@ -33,7 +55,7 @@ def process(xmlpath, issue_ids=None):
             issue for issue in issues if issue.attrib['severity'] == 'Error'
         ]
     if not issues:
-        return
+        return False
     print(xmlpath.resolve().as_uri(), file=sys.stderr)
     for issue in issues:
         [location] = (child for child in issue if child.tag == 'location')
@@ -46,7 +68,8 @@ def process(xmlpath, issue_ids=None):
         except KeyError as e:
             print('{0} error'.format(issue.attrib['id']), file=sys.stderr)
     print(file=sys.stderr)
+    return True
 
 
 if __name__ == '__main__':
-    main()
+    main(sys.argv)
