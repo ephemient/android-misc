@@ -217,6 +217,7 @@ def convert_path(input, source, dest, resolver):
     if f'{{{ANDROID_NS}}}name' in source.attrib:
         target.set('name', source.get(f'{{{ANDROID_NS}}}name'))
     target.set('d', source.get(f'{{{ANDROID_NS}}}pathData'))
+    target.set('fill', 'none')
     alpha = None
     if f'{{{ANDROID_NS}}}fillColor' in source.attrib:
         color, alpha = resolver.color(
